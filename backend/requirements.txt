@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+faster-whisper
+openai
+python-multipart
+langdetect
+pymongo
+python-dotenv
+deep-translator
+passlib[bcrypt]
+python-jose[cryptography]
