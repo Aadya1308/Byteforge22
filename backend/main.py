@@ -1,13 +1,13 @@
 from fastapi import FastAPI, UploadFile, File, Depends, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security import OAuth2PasswordBearer
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from jose import JWTError, jwt
 from passlib.context import CryptContext
 from pymongo import MongoClient
 from datetime import datetime, timedelta
-from fastapi.security import OAuth2PasswordRequestForm
 from fastapi import Depends
 from dotenv import load_dotenv
+from s3 import upload_audio_to_s3, upload_prescription_pdf
 from models import (
     UserRegister, UserLogin, UserResponse,
     PatientCreate, SOAPNote, Prescription,
@@ -43,7 +43,7 @@ mongo = MongoClient(
     os.getenv("MONGO_URL"),
     tlsCAFile=certifi.where()
 )
-db    = mongo["clinicaldoc"]
+db = mongo["clinicaldoc"]
 
 users_col    = db["users"]
 patients_col = db["patients"]
@@ -51,7 +51,6 @@ sessions_col = db["sessions"]
 scripts_col  = db["prescriptions"]
 audit_col    = db["audit"]
 
-# Create indexes for fast lookup
 users_col.create_index("email", unique=True)
 patients_col.create_index("patient_id", unique=True)
 sessions_col.create_index("session_id", unique=True)
@@ -98,6 +97,70 @@ def write_audit(action: str, performed_by: str, target_id: str = "", details: st
     })
 
 
+# ─────────────────────────────────────────────────────────
+#  SOAP STRUCTURING HELPER
+#  Splits the flat dict from the AI into 4 labelled sections
+#  so the response (and stored doc) have clear S / O / A / P
+#  subheadings instead of one giant blob.
+# ─────────────────────────────────────────────────────────
+def structure_soap(soap_data: dict) -> dict:
+    """
+    Takes the raw SOAP dict from generate_full_soap() and returns a new
+    dict with four top-level subheadings: subjective, objective,
+    assessment, plan — plus a meta block for AI confidence/flags.
+    """
+    return {
+        # ── S — Subjective (patient-reported) ──────────────
+        "subjective": {
+            "chief_complaint":       soap_data.get("chief_complaint"),
+            "history_of_illness":    soap_data.get("history_of_illness"),
+            "symptoms":              soap_data.get("symptoms", []),
+            "symptom_duration":      soap_data.get("symptom_duration"),
+            "pain_scale":            soap_data.get("pain_scale"),
+            "patient_reported_meds": soap_data.get("patient_reported_meds", []),
+            "allergies_reported":    soap_data.get("allergies_reported", []),
+        },
+
+        # ── O — Objective (clinician observations) ─────────
+        "objective": {
+            "vital_signs":          soap_data.get("vital_signs"),
+            "physical_examination": soap_data.get("physical_examination"),
+            "lab_results":          soap_data.get("lab_results"),
+            "imaging_results":      soap_data.get("imaging_results"),
+        },
+
+        # ── A — Assessment (diagnosis) ─────────────────────
+        "assessment": {
+            "primary_diagnosis":      soap_data.get("primary_diagnosis"),
+            "differential_diagnosis": soap_data.get("differential_diagnosis", []),
+            "icd_codes":              soap_data.get("icd_codes", []),
+            "clinical_impression":    soap_data.get("clinical_impression"),
+            "severity":               soap_data.get("severity"),
+        },
+
+        # ── P — Plan (treatment) ───────────────────────────
+        "plan": {
+            "medications_prescribed": soap_data.get("medications_prescribed", []),
+            "procedures":             soap_data.get("procedures", []),
+            "lab_tests_ordered":      soap_data.get("lab_tests_ordered", []),
+            "imaging_ordered":        soap_data.get("imaging_ordered", []),
+            "referrals":              soap_data.get("referrals", []),
+            "lifestyle_advice":       soap_data.get("lifestyle_advice", []),
+            "follow_up":              soap_data.get("follow_up"),
+            "sick_leave_days":        soap_data.get("sick_leave_days"),
+            "diet_instructions":      soap_data.get("diet_instructions"),
+            "special_instructions":   soap_data.get("special_instructions"),
+        },
+
+        # ── Meta (AI quality indicators) ───────────────────
+        "meta": {
+            "confidence_score":      soap_data.get("confidence_score", 0.0),
+            "flagged_fields":        soap_data.get("flagged_fields", []),
+            "reviewed_by_clinician": soap_data.get("reviewed_by_clinician", False),
+        }
+    }
+
+
 # ═══════════════════════════════════════════════════════════
 #  AUTH ROUTES
 # ═══════════════════════════════════════════════════════════
@@ -107,19 +170,19 @@ def register(data: UserRegister):
     if users_col.find_one({"email": data.email}):
         raise HTTPException(status_code=400, detail="Email already registered")
 
-    user_id = str(uuid.uuid4())
+    user_id  = str(uuid.uuid4())
     user_doc = {
-        "user_id":        user_id,
-        "full_name":      data.full_name,
-        "email":          data.email,
-        "phone":          data.phone,
-        "role":           data.role,
-        "specialization": data.specialization,
-        "hospital_name":  data.hospital_name,
-        "license_number": data.license_number,
+        "user_id":         user_id,
+        "full_name":       data.full_name,
+        "email":           data.email,
+        "phone":           data.phone,
+        "role":            data.role,
+        "specialization":  data.specialization,
+        "hospital_name":   data.hospital_name,
+        "license_number":  data.license_number,
         "hashed_password": hash_pw(data.password),
-        "is_active":      True,
-        "created_at":     datetime.utcnow().isoformat()
+        "is_active":       True,
+        "created_at":      datetime.utcnow().isoformat()
     }
     users_col.insert_one(user_doc)
     write_audit("USER_REGISTERED", user_id, user_id, f"Role: {data.role}")
@@ -171,10 +234,7 @@ def get_me(current_user: dict = Depends(get_current_user)):
 # ═══════════════════════════════════════════════════════════
 
 @app.post("/patients", tags=["Patients"])
-def create_patient(
-    data: PatientCreate,
-    current_user: dict = Depends(get_current_user)
-):
+def create_patient(data: PatientCreate, current_user: dict = Depends(get_current_user)):
     patient_id = "PAT-" + str(uuid.uuid4())[:8].upper()
     doc = {
         "patient_id":              patient_id,
@@ -209,7 +269,7 @@ def create_patient(
 
 @app.get("/patients", tags=["Patients"])
 def list_patients(
-    search: str = Query(default="", description="Search by name or phone"),
+    search: str = Query(default="", description="Search by name, phone, or ID"),
     skip:   int = 0,
     limit:  int = 20,
     current_user: dict = Depends(get_current_user)
@@ -217,8 +277,8 @@ def list_patients(
     query = {}
     if search:
         query = {"$or": [
-            {"full_name": {"$regex": search, "$options": "i"}},
-            {"phone":     {"$regex": search, "$options": "i"}},
+            {"full_name":  {"$regex": search, "$options": "i"}},
+            {"phone":      {"$regex": search, "$options": "i"}},
             {"patient_id": {"$regex": search, "$options": "i"}}
         ]}
     patients = list(patients_col.find(query, {"_id": 0}).skip(skip).limit(limit))
@@ -227,10 +287,7 @@ def list_patients(
 
 
 @app.get("/patients/{patient_id}", tags=["Patients"])
-def get_patient(
-    patient_id: str,
-    current_user: dict = Depends(get_current_user)
-):
+def get_patient(patient_id: str, current_user: dict = Depends(get_current_user)):
     p = patients_col.find_one({"patient_id": patient_id}, {"_id": 0})
     if not p:
         raise HTTPException(status_code=404, detail="Patient not found")
@@ -238,16 +295,9 @@ def get_patient(
 
 
 @app.get("/patients/{patient_id}/history", tags=["Patients"])
-def get_patient_history(
-    patient_id: str,
-    current_user: dict = Depends(get_current_user)
-):
-    sessions = list(sessions_col.find(
-        {"patient_id": patient_id}, {"_id": 0}
-    ).sort("created_at", -1))
-    prescriptions = list(scripts_col.find(
-        {"patient_id": patient_id}, {"_id": 0}
-    ).sort("date", -1))
+def get_patient_history(patient_id: str, current_user: dict = Depends(get_current_user)):
+    sessions      = list(sessions_col.find({"patient_id": patient_id}, {"_id": 0}).sort("created_at", -1))
+    prescriptions = list(scripts_col.find({"patient_id": patient_id}, {"_id": 0}).sort("date", -1))
     return {
         "patient_id":    patient_id,
         "total_visits":  len(sessions),
@@ -262,43 +312,61 @@ def get_patient_history(
 
 @app.post("/sessions/transcribe", tags=["Clinical Sessions"])
 async def transcribe_and_document(
-    audio:      UploadFile = File(...),
-    patient_id: str        = "unknown",
-    consent:    bool       = True,
-    session_type: str      = "consultation",
-    current_user: dict     = Depends(get_current_user)
+    audio:        UploadFile = File(...),
+    patient_id:   str        = "unknown",
+    consent:      bool       = True,
+    session_type: str        = "consultation",
+    current_user: dict       = Depends(get_current_user)
 ):
-    # ── Consent gate (HIPAA) ───────────────────
+    # ── Consent gate (HIPAA) ───────────────────────────────
     if not consent:
         raise HTTPException(status_code=403, detail="Patient consent required (HIPAA)")
 
-    # ── Get patient info for context ───────────
+    # ── Fetch patient context ──────────────────────────────
     patient_info = {}
     if patient_id != "unknown":
         p = patients_col.find_one({"patient_id": patient_id}, {"_id": 0})
         if p:
             patient_info = p
 
-    # ── Save audio to temp file ────────────────
+    # ── Save upload to temp file ───────────────────────────
     suffix = os.path.splitext(audio.filename)[-1] or ".wav"
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         shutil.copyfileobj(audio.file, tmp)
         tmp_path = tmp.name
 
     try:
-        # Step 1: Transcribe
-        transcription  = transcribe_audio(tmp_path)
-        raw_transcript = transcription["transcript"]
-        detected_lang  = transcription["detected_language"]
+        # ── Step 1: Transcribe ─────────────────────────────
+        transcription   = transcribe_audio(tmp_path)
+        raw_transcript  = transcription["transcript"]
+        detected_lang   = transcription["detected_language"]
         lang_confidence = transcription["language_confidence"]
 
-        # Step 2: Translate if needed
+        # ── Step 2: Upload audio to S3 ─────────────────────
+        # FIX: this call was completely missing in the original code.
+        # The temp file was transcribed and then deleted with os.unlink()
+        # without ever being sent to S3, so the bucket stayed empty.
+        # We now upload BEFORE os.unlink() in the finally block.
+        audio_s3 = upload_audio_to_s3(
+            local_path=tmp_path,
+            patient_id=patient_id,
+            filename=audio.filename
+        )
+        # audio_s3 = {"s3_key": "audio/PAT-.../file.wav", "audio_url": "https://..."}
+
+        # ── Step 3: Translate if needed ────────────────────
         english_transcript = translate_if_needed(raw_transcript, detected_lang)
 
-        # Step 3: Generate full SOAP note
-        soap_data = generate_full_soap(english_transcript, patient_info)
+        # ── Step 4: Generate SOAP note ─────────────────────
+        soap_raw  = generate_full_soap(english_transcript, patient_info)
 
-        # Step 4: Build session record
+        # ── Step 5: Structure SOAP into S / O / A / P ─────
+        # FIX: original code returned soap_data as one flat dict.
+        # structure_soap() splits it into clearly labelled subheadings
+        # so the API response and the stored session doc are both readable.
+        soap_note = structure_soap(soap_raw)
+
+        # ── Step 6: Build session record ───────────────────
         session_id = "SES-" + str(uuid.uuid4())[:8].upper()
 
         session_doc = {
@@ -309,21 +377,27 @@ async def transcribe_and_document(
             "clinician_name":      current_user["full_name"],
             "hospital_name":       current_user.get("hospital_name"),
             "audio_filename":      audio.filename,
+            # FIX: store both S3 key (for future re-signing) and the
+            # short-lived presigned URL (for immediate playback).
+            "audio_s3_key":        audio_s3["s3_key"],
+            "audio_url":           audio_s3["audio_url"],
             "raw_transcript":      raw_transcript,
             "english_transcript":  english_transcript,
             "detected_language":   detected_lang,
             "language_confidence": lang_confidence,
             "session_type":        session_type,
-            "soap_note":           soap_data,
+            # Store the structured SOAP (with subheadings) in the DB
+            "soap_note":           soap_note,
             "status":              "completed",
             "created_at":          datetime.utcnow().isoformat(),
             "completed_at":        datetime.utcnow().isoformat()
         }
         sessions_col.insert_one(session_doc)
 
-        # Step 5: Auto-generate prescription if medications prescribed
+        # ── Step 7: Auto-generate prescription ────────────
         prescription_id = None
-        if soap_data.get("medications_prescribed"):
+        medications     = soap_raw.get("medications_prescribed", [])
+        if medications:
             prescription_id = "RX-" + str(uuid.uuid4())[:8].upper()
             rx_doc = {
                 "prescription_id": prescription_id,
@@ -335,12 +409,12 @@ async def transcribe_and_document(
                 "hospital_name":   current_user.get("hospital_name"),
                 "license_number":  current_user.get("license_number"),
                 "date":            datetime.utcnow().strftime("%Y-%m-%d"),
-                "diagnosis":       soap_data.get("primary_diagnosis", ""),
-                "icd_codes":       soap_data.get("icd_codes", []),
-                "medications":     soap_data.get("medications_prescribed", []),
-                "lab_tests_ordered": soap_data.get("lab_tests_ordered", []),
-                "follow_up":       soap_data.get("follow_up", ""),
-                "special_notes":   soap_data.get("special_instructions", ""),
+                "diagnosis":       soap_raw.get("primary_diagnosis", ""),
+                "icd_codes":       soap_raw.get("icd_codes", []),
+                "medications":     medications,
+                "lab_tests_ordered": soap_raw.get("lab_tests_ordered", []),
+                "follow_up":       soap_raw.get("follow_up", ""),
+                "special_notes":   soap_raw.get("special_instructions", ""),
                 "valid_for_days":  30,
                 "created_at":      datetime.utcnow().isoformat()
             }
@@ -350,7 +424,7 @@ async def transcribe_and_document(
                 {"$set": {"prescription_id": prescription_id}}
             )
 
-        # Step 6: Audit log
+        # ── Step 8: Audit log ──────────────────────────────
         write_audit(
             "CLINICAL_SESSION_CREATED",
             current_user["user_id"],
@@ -358,19 +432,26 @@ async def transcribe_and_document(
             f"Patient: {patient_id}, Lang: {detected_lang}"
         )
 
+        # ── Return structured response ─────────────────────
         return {
             "session_id":         session_id,
             "prescription_id":    prescription_id,
             "patient_id":         patient_id,
             "detected_language":  detected_lang,
+            "language_confidence": lang_confidence,
+            "audio_s3_key":       audio_s3["s3_key"],
+            "audio_url":          audio_s3["audio_url"],
             "raw_transcript":     raw_transcript,
             "english_transcript": english_transcript,
-            "soap_note":          soap_data,
-            "status":             "completed"
+            # SOAP is now broken into S / O / A / P subheadings
+            "soap_note": soap_note,
+            "status": "completed"
         }
 
     finally:
-        os.unlink(tmp_path)
+        # Always clean up the local temp file after S3 upload is done
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -387,15 +468,17 @@ def list_sessions(
     query = {}
     if patient_id:
         query["patient_id"] = patient_id
-    sessions = list(sessions_col.find(query, {"_id": 0}).sort("created_at", -1).skip(skip).limit(limit))
+    sessions = list(
+        sessions_col.find(query, {"_id": 0})
+        .sort("created_at", -1)
+        .skip(skip)
+        .limit(limit)
+    )
     return {"total": len(sessions), "sessions": sessions}
 
 
 @app.get("/sessions/{session_id}", tags=["Clinical Sessions"])
-def get_session(
-    session_id: str,
-    current_user: dict = Depends(get_current_user)
-):
+def get_session(session_id: str, current_user: dict = Depends(get_current_user)):
     s = sessions_col.find_one({"session_id": session_id}, {"_id": 0})
     if not s:
         raise HTTPException(status_code=404, detail="Session not found")
@@ -403,14 +486,11 @@ def get_session(
 
 
 @app.patch("/sessions/{session_id}/review", tags=["Clinical Sessions"])
-def mark_reviewed(
-    session_id: str,
-    current_user: dict = Depends(get_current_user)
-):
+def mark_reviewed(session_id: str, current_user: dict = Depends(get_current_user)):
     sessions_col.update_one(
         {"session_id": session_id},
         {"$set": {
-            "status": "reviewed",
+            "status":      "reviewed",
             "reviewed_by": current_user["full_name"],
             "reviewed_at": datetime.utcnow().isoformat()
         }}
@@ -424,10 +504,7 @@ def mark_reviewed(
 # ═══════════════════════════════════════════════════════════
 
 @app.get("/prescriptions/{prescription_id}", tags=["Prescriptions"])
-def get_prescription(
-    prescription_id: str,
-    current_user: dict = Depends(get_current_user)
-):
+def get_prescription(prescription_id: str, current_user: dict = Depends(get_current_user)):
     rx = scripts_col.find_one({"prescription_id": prescription_id}, {"_id": 0})
     if not rx:
         raise HTTPException(status_code=404, detail="Prescription not found")
@@ -435,10 +512,7 @@ def get_prescription(
 
 
 @app.get("/prescriptions/patient/{patient_id}", tags=["Prescriptions"])
-def get_patient_prescriptions(
-    patient_id: str,
-    current_user: dict = Depends(get_current_user)
-):
+def get_patient_prescriptions(patient_id: str, current_user: dict = Depends(get_current_user)):
     rxs = list(scripts_col.find({"patient_id": patient_id}, {"_id": 0}).sort("date", -1))
     return {"patient_id": patient_id, "total": len(rxs), "prescriptions": rxs}
 
@@ -449,25 +523,21 @@ def get_patient_prescriptions(
 
 @app.get("/health", tags=["System"])
 def health():
-    return {
-        "status":  "ok",
-        "service": "ClinicalDoc API v2",
-        "team":    "ByteForge22"
-    }
+    return {"status": "ok", "service": "ClinicalDoc API v2", "team": "ByteForge22"}
 
 
 @app.get("/config", tags=["System"])
 def config():
     return {
-        "supported_languages":  ["en", "hi", "te", "ta", "ml", "kn", "bn", "mr"],
-        "supported_audio":      ["wav", "mp3", "m4a", "ogg", "mp4"],
-        "asr_model":            "faster-whisper-small",
-        "llm_model":            "llama-3.3-70b-versatile (Groq)",
-        "soap_sections":        ["Subjective", "Objective", "Assessment", "Plan"],
-        "user_roles":           ["doctor", "nurse", "admin", "receptionist"],
-        "session_types":        ["consultation", "follow_up", "emergency"],
-        "icd_version":          "ICD-10",
-        "compliance":           ["HIPAA", "audit_logging", "consent_gating"]
+        "supported_languages": ["en", "hi", "te", "ta", "ml", "kn", "bn", "mr"],
+        "supported_audio":     ["wav", "mp3", "m4a", "ogg", "mp4"],
+        "asr_model":           "faster-whisper-small",
+        "llm_model":           "llama-3.3-70b-versatile (Groq)",
+        "soap_sections":       ["Subjective", "Objective", "Assessment", "Plan"],
+        "user_roles":          ["doctor", "nurse", "admin", "receptionist"],
+        "session_types":       ["consultation", "follow_up", "emergency"],
+        "icd_version":         "ICD-10",
+        "compliance":          ["HIPAA", "audit_logging", "consent_gating"]
     }
 
 
@@ -481,3 +551,20 @@ def get_audit_log(
         raise HTTPException(status_code=403, detail="Admin access only")
     logs = list(audit_col.find({}, {"_id": 0}).sort("timestamp", -1).skip(skip).limit(limit))
     return {"total": len(logs), "logs": logs}
+
+
+@app.get("/prescriptions/{prescription_id}/pdf", tags=["Prescriptions"])
+def download_prescription_pdf(
+    prescription_id: str,
+    current_user: dict = Depends(get_current_user)
+):
+    rx = scripts_col.find_one({"prescription_id": prescription_id}, {"_id": 0})
+    if not rx:
+        raise HTTPException(status_code=404, detail="Prescription not found")
+    pdf_url = upload_prescription_pdf(rx)
+    write_audit("PRESCRIPTION_DOWNLOADED", current_user["user_id"], prescription_id)
+    return {
+        "prescription_id": prescription_id,
+        "pdf_url":         pdf_url,
+        "expires_in":      "7 days"
+    }
