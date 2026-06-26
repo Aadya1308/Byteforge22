@@ -1,286 +1,294 @@
-# Multilingual AI-Powered Clinical Documentation & Decision Support System
+# ClinicalDoc AI — ByteForge22
 
-A comprehensive backend system for automating clinical documentation during doctor-patient interactions, converting unstructured multilingual speech into structured medical records.
+> **Real-time multilingual clinical documentation system** that converts doctor-patient audio conversations into structured SOAP notes, ICD-10 coded prescriptions, and EHR-ready records — automatically.
 
-## Features
+Built by **Team ByteForge22** for Cognizant Technoverse Hackathon 2026.
 
-- **Real-time Audio Processing**: Capture and evaluate audio quality with consent validation
-- **Multilingual ASR**: Whisper-powered speech-to-text with automatic language detection
-- **Translation Services**: Support for 8+ languages (English, Spanish, French, German, Hindi, Chinese, Japanese, Arabic)
-- **Clinical NLP**: Advanced entity extraction for symptoms, medications, diagnoses, and procedures
-- **Knowledge Retrieval**: ICD-10 code suggestions and drug information integration
-- **SOAP Note Generation**: Structured clinical documentation with validation
-- **HL7 FHIR Integration**: EHR-ready output formats
-- **Quality Assurance**: Document validation and hallucination detection
+**Team:** Aadya Kasi Reddy (Lead) · Vaidya Adithi · Aishani Pureddiwar · Ramavath Poojitha
 
-## Architecture
+---
 
-The system implements an 11-step workflow pipeline:
+## What it does
 
-1. **Capture**: Audio stream + patient consent validation
-2. **Evaluator/Guardrail**: Consent and audio quality checks
-3. **Transcribe**: Whisper ASR with language detection
-4. **Condition/Branch**: Translation for non-English content
-5. **Extract**: Clinical NLP for entity extraction
-6. **Knowledge Retrieval**: Drug database and ICD code lookup
-7. **Structure**: SOAP note formatting
-8. **Merge**: Combine SOAP, ICD, and entities
-9. **Validate**: Hallucination and completeness checks
-10. **Format**: HL7 FHIR/JSON output formatting
-11. **Deliver**: EHR integration with session memory updates
+A doctor records or uploads a consultation audio. The system:
 
-## Quick Start
+1. Validates patient consent (HIPAA gate)
+2. Transcribes speech using **faster-whisper** (local ASR, 8 Indian languages)
+3. Translates non-English audio to English via **Llama-3.3-70B on Groq**
+4. Generates a structured **SOAP note** (Subjective / Objective / Assessment / Plan) with ICD-10 codes
+5. Auto-creates a **prescription** if medications are detected
+6. Stores audio on **AWS S3** with presigned URLs, records in **MongoDB Atlas**
+7. Generates downloadable **PDF prescriptions** via ReportLab
+8. Logs every action to an **audit trail** for HIPAA compliance
 
-### Prerequisites
+---
+
+## Tech Stack
+
+| Layer | Technology |
+|---|---|
+| Backend API | FastAPI 0.111 + Uvicorn |
+| Speech-to-Text | faster-whisper 1.0.3 (small, CPU, int8) |
+| LLM | Llama-3.3-70B-Versatile via Groq API |
+| Database | MongoDB Atlas (PyMongo 4.7) |
+| Auth | JWT (HS256) + bcrypt via python-jose + passlib |
+| Cloud Storage | AWS S3 (boto3) + presigned URLs |
+| PDF Generation | ReportLab |
+| Data Validation | Pydantic v2 |
+| Frontend | React 19 + Vite 8 |
+
+---
+
+## Supported Languages
+
+`en` English · `hi` Hindi · `te` Telugu · `ta` Tamil · `ml` Malayalam · `kn` Kannada · `bn` Bengali · `mr` Marathi
+
+---
+
+## Architecture — 8-Step Pipeline
+
+```
+Audio Upload (wav/mp3/m4a/ogg/mp4)
+        │
+        ▼
+[1] Consent Gate (HIPAA) ──✗──► 403 Forbidden
+        │ ✓
+        ▼
+[2] Fetch Patient Context (MongoDB → allergies, chronic conditions, meds)
+        │
+        ▼
+[3] faster-whisper ASR → {transcript, detected_language, language_confidence}
+        │
+        ▼
+[4] Upload audio to S3 → {s3_key, presigned_url (1hr)}
+        │
+        ▼
+[5] Translate if non-English (Llama-3.3-70B via Groq) ──skip if English──►
+        │
+        ▼
+[6] Generate SOAP note (Llama-3.3-70B, temp=0.1, strict JSON schema)
+        │
+        ▼
+[7] structure_soap() → {subjective, objective, assessment, plan, meta}
+        │
+        ▼
+[8] Persist: session → MongoDB
+    Auto-create prescription (if medications found) → MongoDB
+    Audit log entry → MongoDB
+    PDF on demand → ReportLab → S3 (7-day presigned URL)
+```
+
+---
+
+## Project Structure
+
+```
+Byteforge22/
+├── backend/
+│   ├── main.py          # FastAPI app, all routes, auth, pipeline orchestration
+│   ├── ai.py            # Whisper ASR, Groq LLM calls, translation, SOAP generation
+│   ├── models.py        # Pydantic models: UserRegister, PatientCreate, SOAPNote, Prescription...
+│   ├── s3.py            # AWS S3 upload, presigned URLs, ReportLab PDF generation
+│   └── requirements.txt
+├── frontend/
+│   └── src/
+│       └── App.jsx      # React SPA: Auth, Patients, Transcribe, Sessions, Prescriptions, System
+└── README.md
+```
+
+---
+
+## Prerequisites
 
 - Python 3.11+
-- Groq's Llama 3.3 API key
+- Node.js 18+
+- MongoDB Atlas account (free tier works)
+- AWS account with an S3 bucket (private)
+- Groq API key (free tier: [console.groq.com](https://console.groq.com))
 
-### Installation
+---
 
-1. Clone the repository:
+## Backend Setup
+
 ```bash
-git clone <repository-url>
-cd CLINICAL-DOCUMENTATION
-```
-
-2. Create virtual environment:
-```bash
+cd backend
 python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-```
-
-3. Install dependencies:
-```bash
+source venv/bin/activate      # Windows: venv\Scripts\activate
 pip install -r requirements.txt
+pip install boto3 reportlab certifi
 ```
 
-4. Download spaCy models:
-```bash
-python -m spacy download en_core_web_sm
+Create a `.env` file in `backend/`:
+
+```env
+MONGO_URL=mongodb+srv://<user>:<password>@cluster.mongodb.net/
+SECRET_KEY=your-strong-random-secret-key-here
+GROQ_API_KEY=gsk_xxxxxxxxxxxxxxxxxxxxxxxxxxxx
+AWS_ACCESS_KEY_ID=AKIAxxxxxxxxxxxxxxxx
+AWS_SECRET_ACCESS_KEY=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+AWS_REGION=ap-south-1
+S3_BUCKET_NAME=your-bucket-name
 ```
 
-5. Set up environment variables:
-```bash
-cp .env.example .env
-# Edit .env with your configuration
-```
+Run the server:
 
-6. Initialize database:
-```bash
-# Create PostgreSQL database and run migrations
-alembic upgrade head
-```
-
-### API Documentation
-
-Once the server is running, you can access comprehensive API documentation:
-
-- **Swagger UI**: `http://localhost:8000/docs` - Interactive API documentation
-- **ReDoc**: `http://localhost:8000/redoc` - Alternative documentation view
-- **OpenAPI Schema**: `http://localhost:8000/openapi.json` - Raw API schema
-
-#### Documentation Features:
-- **Interactive Testing**: Try API endpoints directly from the browser
-- **Request/Response Examples**: Clear examples for all endpoints
-- **Schema Validation**: Automatic request validation
-- **Authentication Support**: Bearer token authentication
-- **Tagged Endpoints**: Organized by functional areas
-- **Detailed Descriptions**: Comprehensive endpoint documentation
-
-### Manual Setup
-
-1. Run the application:
 ```bash
 uvicorn main:app --reload --host 0.0.0.0 --port 8000
 ```
 
-## API Endpoints
+API docs available at:
+- Swagger UI: `http://localhost:8000/docs`
+- ReDoc: `http://localhost:8000/redoc`
 
-### Audio Processing
-- `POST /api/v1/upload-audio` - Upload audio file
-- `POST /api/v1/process-workflow` - Process clinical documentation workflow
-- `POST /api/v1/process-workflow-async` - Async workflow processing
+---
 
-### Patient Management
-- `POST /api/v1/patients` - Create patient record
-- `GET /api/v1/patients/{patient_id}` - Get patient information
-- `GET /api/v1/patients/{patient_id}/sessions` - Get patient sessions
-
-### Clinical Sessions
-- `GET /api/v1/sessions/{session_id}` - Get session details
-- `GET /api/v1/sessions/{session_id}/documents` - Get session documents
-
-### Documents
-- `GET /api/v1/documents/{document_id}` - Get clinical document
-
-### System
-- `GET /api/v1/health` - Health check
-- `GET /api/v1/config` - System configuration
-
-## Usage Example
-
-### 1. Upload Audio and Process Workflow
-
-```python
-import requests
-
-# Upload audio file
-with open("consultation.wav", "rb") as f:
-    upload_response = requests.post(
-        "http://localhost:8000/api/v1/upload-audio",
-        files={"file": f},
-        data={
-            "patient_id": "PAT123",
-            "clinician_id": "DOC456",
-            "consent_given": True
-        }
-    )
-
-# Process workflow
-workflow_response = requests.post(
-    "http://localhost:8000/api/v1/process-workflow",
-    json={
-        "audio_file_path": upload_response.json()["file_path"],
-        "patient_id": "PAT123",
-        "clinician_id": "DOC456",
-        "consent_given": True
-    }
-)
-
-result = workflow_response.json()
-print(f"Session ID: {result['session_id']}")
-print(f"Status: {result['status']}")
-print(f"Document: {result['document']['content']}")
-```
-
-### 2. Create Patient Record
-
-```python
-patient_response = requests.post(
-    "http://localhost:8000/api/v1/patients",
-    json={
-        "patient_id": "PAT123",
-        "name": "John Doe",
-        "date_of_birth": "1980-01-15T00:00:00Z",
-        "gender": "M",
-        "contact_info": "john.doe@email.com"
-    }
-)
-```
-
-## Configuration
-
-### Environment Variables
-
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `DATABASE_URL` | PostgreSQL connection string | - |
-| `REDIS_URL` | Redis connection string | - |
-| `OPENAI_API_KEY` | OpenAI API key for GPT services | - |
-| `WHISPER_MODEL` | Whisper model size | `base` |
-| `MAX_FILE_SIZE` | Maximum audio file size (bytes) | `25000000` |
-| `SUPPORTED_LANGUAGES` | Supported language codes | `en,es,fr,de,hi,zh,ja,ar` |
-
-### Audio Formats
-
-Supported audio formats:
-- WAV
-- MP3
-- M4A
-- FLAC
-
-### Supported Languages
-
-- English (en)
-- Spanish (es)
-- French (fr)
-- German (de)
-- Hindi (hi)
-- Chinese (zh)
-- Japanese (ja)
-- Arabic (ar)
-
-## Development
-
-### Running Tests
+## Frontend Setup
 
 ```bash
-pytest tests/
+cd frontend
+npm install
+npm run dev
 ```
 
-### Code Structure
+Opens at `http://localhost:5173`. The frontend connects to the backend at `http://127.0.0.1:8000` — ensure the backend is running first.
 
+---
+
+## API Endpoints
+
+### Auth
+| Method | Endpoint | Description |
+|---|---|---|
+| POST | `/auth/register` | Register doctor/nurse/admin/receptionist |
+| POST | `/auth/login` | Login (returns JWT bearer token) |
+| GET | `/auth/me` | Get current user profile |
+
+### Patients
+| Method | Endpoint | Description |
+|---|---|---|
+| POST | `/patients` | Create patient record |
+| GET | `/patients` | List patients (search by name/phone/ID) |
+| GET | `/patients/{patient_id}` | Get patient details |
+| GET | `/patients/{patient_id}/history` | Get all sessions + prescriptions |
+
+### Clinical Sessions
+| Method | Endpoint | Description |
+|---|---|---|
+| POST | `/sessions/transcribe` | **Core endpoint** — upload audio, get SOAP note |
+| GET | `/sessions` | List sessions (filter by patient_id) |
+| GET | `/sessions/{session_id}` | Get session with full SOAP note |
+| PATCH | `/sessions/{session_id}/review` | Mark session as clinician-reviewed |
+
+### Prescriptions
+| Method | Endpoint | Description |
+|---|---|---|
+| GET | `/prescriptions/{prescription_id}` | Get prescription |
+| GET | `/prescriptions/patient/{patient_id}` | All prescriptions for a patient |
+| GET | `/prescriptions/{prescription_id}/pdf` | Generate + download PDF (S3 presigned) |
+
+### System
+| Method | Endpoint | Description |
+|---|---|---|
+| GET | `/health` | Health check |
+| GET | `/config` | Supported languages, models, formats |
+| GET | `/audit` | Audit log (admin only) |
+
+---
+
+## SOAP Note Structure
+
+Every transcription returns a structured SOAP note:
+
+```json
+{
+  "subjective": {
+    "chief_complaint": "...",
+    "symptoms": ["fever", "headache"],
+    "symptom_duration": "3 days",
+    "pain_scale": null,
+    "patient_reported_meds": [],
+    "allergies_reported": []
+  },
+  "objective": {
+    "vital_signs": { "blood_pressure": null, "temperature": "101°F" },
+    "physical_examination": "..."
+  },
+  "assessment": {
+    "primary_diagnosis": "Acute upper respiratory infection",
+    "icd_codes": [{ "code": "J06.9", "description": "...", "category": "Respiratory" }],
+    "severity": "mild"
+  },
+  "plan": {
+    "medications_prescribed": [
+      { "name": "Paracetamol", "dosage": "500mg", "frequency": "twice daily", "duration": "5 days", "route": "oral" }
+    ],
+    "follow_up": "Review after 5 days"
+  },
+  "meta": {
+    "confidence_score": 0.87,
+    "flagged_fields": []
+  }
+}
 ```
-app/
-├── api/v1/          # API endpoints
-├── core/            # Configuration and database
-├── models/          # Database models
-├── schemas/         # Pydantic schemas
-├── services/        # Business logic services
-└── utils/           # Utility functions
-```
 
-### Services Overview
+---
 
-- **WorkflowEngine**: Orchestrates the entire clinical documentation pipeline
-- **AudioProcessor**: Handles audio quality evaluation and preprocessing
-- **TranscriptionService**: Whisper-based ASR with language detection
-- **TranslationService**: Multilingual text translation
-- **ClinicalNLPService**: Medical entity extraction
-- **KnowledgeRetrievalService**: ICD codes and drug information lookup
-- **DocumentStructurer**: SOAP note generation and formatting
-- **ValidationService**: Document quality and validation checks
-- **EHRIntegrationService**: HL7 FHIR formatting and EHR integration
+## User Roles
 
-## Deployment
+| Role | Capabilities |
+|---|---|
+| `doctor` | Full access — transcribe, create patients, review sessions |
+| `nurse` | Create patients, view sessions |
+| `admin` | All above + access to audit logs |
+| `receptionist` | Create/view patients only |
 
-### AWS Deployment
+---
 
-1. S3 for audio file storage
+## Security & Compliance
 
-### Azure Deployment
+- **Consent gate**: Every transcription requires explicit `consent=True`; returns 403 otherwise
+- **JWT auth**: HS256 tokens with 8-hour expiry on all protected routes
+- **Password security**: bcrypt hashing via passlib
+- **Audit trail**: Every significant action (login, patient create, session create, prescription download) is logged with timestamp, actor, and target
+- **Private S3**: Audio and PDFs stored in a private bucket; access only via time-limited presigned URLs (audio: 1hr, PDF: 7 days)
+- **Admin-only audit**: `/audit` endpoint returns 403 for non-admin roles
 
-1. Azure Container Instances/App Service
-2. Azure Database for PostgreSQL
-3. Azure Cache for Redis
-4. Azure Blob Storage
-5. Azure Application Gateway
+---
 
-## Security Considerations
+## MongoDB Collections
 
-- All audio files are processed with explicit patient consent
-- HIPAA-compliant data handling
-- Encrypted storage and transmission
-- Audit logging for all clinical data access
-- Regular security updates and vulnerability scanning
+| Collection | Indexed Fields | Purpose |
+|---|---|---|
+| `users` | `email` (unique) | Clinician accounts |
+| `patients` | `patient_id` (unique) | Patient records |
+| `sessions` | `session_id` (unique) | Clinical sessions + SOAP notes |
+| `prescriptions` | — | Auto-generated prescriptions |
+| `audit` | — | Immutable action log |
 
-## Performance
+---
 
-- Async processing for workflow steps
-- Redis caching for knowledge base data
-- Optimized audio processing pipelines
-- Database connection pooling
-- Horizontal scaling support
+## Environment Variable Reference
 
-## Monitoring
+| Variable | Required | Description |
+|---|---|---|
+| `MONGO_URL` | ✓ | MongoDB Atlas connection string |
+| `SECRET_KEY` | ✓ | JWT signing secret (use a strong random key) |
+| `GROQ_API_KEY` | ✓ | Groq API key for Llama-3.3-70B |
+| `AWS_ACCESS_KEY_ID` | ✓ | AWS credentials for S3 |
+| `AWS_SECRET_ACCESS_KEY` | ✓ | AWS credentials for S3 |
+| `AWS_REGION` | ✓ | S3 bucket region (default: `ap-south-1`) |
+| `S3_BUCKET_NAME` | ✓ | Name of your private S3 bucket |
 
-- Health check endpoints
-- Performance metrics collection
-- Error tracking and alerting
-- Workflow execution monitoring
-- Resource usage tracking
+---
+
+## Known Limitations
+
+- Whisper runs on CPU synchronously — not suitable for high concurrency without a task queue (Celery + Redis recommended)
+- CORS is currently set to `allow_origins=["*"]` — restrict to frontend domain in production
+- Frontend stores JWT in localStorage — consider HttpOnly cookies for production
+
+---
 
 ## License
 
-This project is licensed under the MIT License - see the LICENSE file for details.
-
-## Team
-
-**ByteForge22**
-- Team Lead: Aadya Kasi Reddy
-- Team Members: Vaidya Adithi, Aishani Pureddiwar, Ramavath Poojitha
-
-## Support
-
-For support and inquiries, please contact the development team or create an issue in the repository.
+MIT License
