@@ -34,10 +34,7 @@ The system implements an 11-step workflow pipeline:
 ### Prerequisites
 
 - Python 3.11+
-- PostgreSQL database
-- Redis (for caching)
-- OpenAI API key
-- FFmpeg (for audio processing)
+- Groq's Llama 3.3 API key
 
 ### Installation
 
@@ -75,15 +72,6 @@ cp .env.example .env
 alembic upgrade head
 ```
 
-### Running with Docker
-
-1. Build and run with Docker Compose:
-```bash
-docker-compose up -d
-```
-
-2. The API will be available at `http://localhost:8000`
-
 ### API Documentation
 
 Once the server is running, you can access comprehensive API documentation:
@@ -102,8 +90,7 @@ Once the server is running, you can access comprehensive API documentation:
 
 ### Manual Setup
 
-1. Start PostgreSQL and Redis services
-2. Run the application:
+1. Run the application:
 ```bash
 uvicorn main:app --reload --host 0.0.0.0 --port 8000
 ```
@@ -250,11 +237,7 @@ app/
 
 ### AWS Deployment
 
-1. Use ECS/EKS for container orchestration
-2. RDS for PostgreSQL
-3. ElastiCache for Redis
-4. S3 for audio file storage
-5. Application Load Balancer for API gateway
+1. S3 for audio file storage
 
 ### Azure Deployment
 
